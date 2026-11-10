@@ -1,0 +1,500 @@
+# ============================================================================
+# 01. GENOTYPE QC, DIVERSITY, ALLELE FREQUENCIES, PAIRWISE FST
+# ============================================================================
+packages <- c("tidyverse", "adegenet", "hierfstat", "ggrepel")
+missing_packages <- setdiff(packages, rownames(installed.packages()))
+if (length(missing_packages)) install.packages(missing_packages)
+invisible(lapply(packages, library, character.only = TRUE))
+
+# 01. Input ---------------------------------------------------------------
+genotype_file <- "insert csv here" # Diploid microsatellite CSV: site, sample_id, followed by two allele-size columns per locus in the order listed below; one row per individual
+output_dir <- "genetic_outputs"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+loci <- c("Dvex3", "Dvex5", "Dvex12", "Dvex20", "Dvex23", "Dvex26", "Dvex30", "Dvex32", "Dvex42")
+site_levels <- c("DE", "FB", "HMB", "SFYC", "PB")
+site_labels <- c(DE = "Drakes Estero", FB = "Fort Baker", HMB = "Half Moon Bay", SFYC = "St. Francis Yacht Club", PB = "Point Bonita")
+site_colors <- c(DE = "#A64CE6", FB = "#C8B900", HMB = "#1565D8", SFYC = "#14B83A", PB = "#D95F02")
+normalize_site <- function(x) {
+  x <- trimws(as.character(x))
+  dplyr::recode(x, "1" = "PB", "2" = "HMB", "3" = "FB", "4" = "SFYC", "5" = "DE",
+                "Drakes Estero" = "DE", "Fort Baker" = "FB", "Half Moon Bay" = "HMB",
+                "St. Francis Yacht Club" = "SFYC", "Point Bonita" = "PB", .default = x)
+}
+write_out <- function(x, name) readr::write_csv(x, file.path(output_dir, name))
+save_plot <- function(p, name, w = 12, h = 7) ggplot2::ggsave(file.path(output_dir, name), p, width = w, height = h, dpi = 300)
+
+# 02. Import and validate -------------------------------------------------
+raw <- readr::read_csv(genotype_file, show_col_types = FALSE, name_repair = "minimal")
+stopifnot(ncol(raw) >= 2 + 2 * length(loci))
+geno <- as_tibble(raw[, seq_len(2 + 2 * length(loci))])
+names(geno) <- c("site", "sample_id", as.vector(rbind(paste0(loci, "_A1"), paste0(loci, "_A2"))))
+geno <- geno %>% mutate(site = normalize_site(site), sample_id = as.character(sample_id),
+                        across(matches("_A[12]$"), ~ suppressWarnings(as.numeric(.x))))
+stopifnot(all(genosite%in%sitelevels),!anyNA(genosample_id),
+          !anyDuplicated(paste(genosite,genosample_id)))
+geno <- geno %>% mutate(individual = paste(site, sample_id, sep = "_"))
+for (loc in loci) {
+  a <- paste0(loc, "_A1"); b <- paste0(loc, "_A2")
+  geno[[a]][geno[[a]] == 0] <- NA_real_
+  geno[[b]][geno[[b]] == 0] <- NA_real_
+  partial <- xor(is.na(geno[[a]]), is.na(geno[[b]]))
+  geno[[a]][partial] <- NA_real_; geno[[b]][partial] <- NA_real_
+}
+geno_long <- purrr::map_dfr(loci, function(loc) {
+  tibble(site = genosite,individual=genoindividual, locus = loc,
+         A1 = geno[[paste0(loc, "_A1")]], A2 = geno[[paste0(loc, "_A2")]])
+}) %>% mutate(heterozygosity = case_when(is.na(A1) | is.na(A2) ~ NA_integer_, A1 != A2 ~ 1L, TRUE ~ 0L))
+write_out(geno_long, "genotype_locus_heterozygosity.csv")
+write_out(geno_long %>% group_by(site, locus) %>% summarise(n_samples = n(), n_missing = sum(is.na(heterozygosity)), proportion_missing = n_missing / n_samples, .groups = "drop"), "genotype_missingness.csv")
+
+# 03. Diversity -----------------------------------------------------------
+geno_strings <- geno %>% select(site, individual)
+for (loc in loci) {
+  a <- geno[[paste0(loc, "_A1")]]; b <- geno[[paste0(loc, "_A2")]]
+  geno_strings[[loc]] <- ifelse(is.na(a) | is.na(b), NA_character_, paste(a, b, sep = "/"))
+}
+gi <- adegenet::df2genind(as.data.frame(geno_strings[, loci]), sep = "/", ploidy = 2,
+                          ind.names = geno_stringsindividual,pop=factor(genostringssite),
+                          type = "codom", NA.char = "NA")
+hf <- hierfstat::genind2hierfstat(gi)
+bs <- hierfstat::basic.stats(hf)
+ar <- hierfstat::allelic.richness(hf)$Ar
+pops <- levels(adegenet::pop(gi))
+site_metric <- function(mat) {
+  z <- colMeans(mat, na.rm = TRUE)
+  as.numeric(z[pops])
+}
+alleles <- geno_long %>% filter(!is.na(A1), !is.na(A2)) %>%
+  pivot_longer(c(A1, A2), names_to = "copy", values_to = "allele")
+allele_counts <- alleles %>% group_by(site, locus) %>% summarise(n_alleles = n_distinct(allele), .groups = "drop")
+allele_frequencies <- alleles %>% count(site, locus, allele, name = "count") %>%
+  group_by(site, locus) %>% mutate(frequency = count / sum(count)) %>% ungroup()
+private_alleles <- allele_frequencies %>% group_by(locus, allele) %>% filter(n_distinct(site) == 1) %>% ungroup()
+mlg <- geno_strings %>% rowwise() %>% mutate(
+  mlg_key = paste(vapply(loci, function(loc) {
+    val <- .data[[loc]]
+    if (is.na(val)) return("NA")
+    paste(sort(as.numeric(strsplit(val, "/", fixed = TRUE)[[1]])), collapse = "/")
+  }, character(1)), collapse = "|")) %>% ungroup() %>%
+  group_by(site) %>% summarise(MLG = n_distinct(mlg_key), .groups = "drop")
+site_diversity <- tibble(site = pops, N = as.integer(table(factor(geno_strings$site, levels = pops))),
+                         Ho = site_metric(bsHo),He=sitemetric(bsHs), Fis = site_metric(bs$Fis),
+                         Allelic_Richness = site_metric(ar)) %>%
+  left_join(allele_counts %>% group_by(site) %>% summarise(NA_mean = mean(n_alleles), .groups = "drop"), by = "site") %>%
+  left_join(private_alleles %>% count(site, name = "Private_Alleles"), by = "site") %>%
+  left_join(mlg, by = "site") %>% mutate(Private_Alleles = replace_na(Private_Alleles, 0L))
+write_out(allele_counts, "allele_counts.csv")
+write_out(allele_frequencies, "allele_frequencies.csv")
+write_out(private_alleles, "private_alleles.csv")
+write_out(site_diversity, "genetic_diversity_summary.csv")
+
+# 04. Allele-frequency figure ---------------------------------------------
+p <- ggplot(allele_frequencies, aes(factor(allele), frequency, fill = site)) +
+  geom_col(position = position_dodge(width = 0.85), width = 0.8) +
+  facet_wrap(~ locus, scales = "free_x", ncol = 3) +
+  scale_fill_manual(values = site_colors) +
+  labs(x = "Allele size (bp)", y = "Allele frequency", fill = "Population") +
+  theme_classic(base_size = 11) + theme(axis.text.x = element_text(angle = 90, hjust = 1))
+save_plot(p, "allele_frequencies.png", 15, 11)
+
+# 05. Pairwise FST --------------------------------------------------------
+fst <- hierfstat::pairwise.WCfst(hf)
+fst_table <- as.data.frame(as.table(as.matrix(fst))) %>%
+  setNames(c("site_1", "site_2", "Fst")) %>%
+  mutate(across(c(site_1, site_2), as.character)) %>%
+  filter(site_1 < site_2, is.finite(Fst)) %>%
+  mutate(pair = paste(site_1, site_2, sep = " vs "))
+write_out(fst_table, "pairwise_Fst.csv")
+p <- ggplot(fst_table, aes(Fst, reorder(pair, Fst))) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey60") +
+  geom_point(size = 3) + labs(x = "Pairwise FST", y = "Population pair") + theme_classic(base_size = 12)
+save_plot(p, "pairwise_Fst_points.png", 9, 6)
+
+# ============================================================================
+# 02. ENVIRONMENTAL LOGGER QUALITY CONTROL
+# ============================================================================
+library(tidyverse)
+library(lubridate)
+
+# 01. Input and site naming -----------------------------------------------
+input_file <- "insert csv here" # Raw 30-minute logger CSV with DateTime (YYYY-MM-DD HH:MM:SS), Salinity (PSU), Temperature (degrees C)
+site_code <- "insert name here" # Short site code
+site_name <- "insert name here" # Full sampling site name
+reviewed_file <- "insert csv here" # AFTER manual review: exported all_observations_with_QC_flags.csv, with every review_decision changed to KEEP or REMOVE; leave placeholder for initial run
+output_dir <- paste0(site_code, "_environmental_QC_outputs")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# 02. Import --------------------------------------------------------------
+raw <- readr::read_csv(input_file, show_col_types = FALSE)
+stopifnot(all(c("DateTime", "Salinity", "Temperature") %in% names(raw)))
+parse_times <- function(x) {
+  out <- suppressWarnings(ymd_hms(trimws(as.character(x)), tz = "UTC", quiet = TRUE))
+  if (anyNA(out)) stop("Unparseable DateTime values; expected YYYY-MM-DD HH:MM:SS.")
+  out
+}
+dat <- raw %>% transmute(DateTime = parse_times(DateTime),
+                         Salinity = suppressWarnings(as.numeric(Salinity)),
+                         Temperature = suppressWarnings(as.numeric(Temperature))) %>% arrange(DateTime)
+if (!nrow(dat) || anyDuplicated(dat$DateTime)) stop("Empty dataset or duplicate timestamps.")
+
+# 03. QC settings ---------------------------------------------------------
+iqr_multiplier <- 1.5
+expected_interval_minutes <- 30
+rate_mad_multiplier <- 6
+neighbor_mad_multiplier <- 6
+min_salinity_review <- 5 # Review criterion only; not an automatic exclusion
+
+# 04. Flagging ------------------------------------------------------------
+robust_limit <- function(x, multiplier) {
+  x <- x[is.finite(x)]
+  if (length(x) < 5) return(Inf)
+  center <- median(x)
+  spread <- mad(x, center = center, constant = 1.4826)
+  if (!is.finite(spread) || spread == 0) return(Inf)
+  center + multiplier * spread
+}
+flag_variable <- function(df, variable) {
+  x <- df[[variable]]
+  valid <- x[is.finite(x)]
+  if (length(valid) < 4) stop(paste("Insufficient observations for", variable))
+  q <- quantile(valid, c(.25, .75), names = FALSE)
+  low <- q[1] - iqr_multiplier * (q[2] - q[1])
+  high <- q[2] + iqr_multiplier * (q[2] - q[1])
+  prev_gap <- as.numeric(difftime(dfDateTime,lag(dfDateTime), units = "mins"))
+  next_gap <- as.numeric(difftime(lead(dfDateTime),dfDateTime, units = "mins"))
+  adjacent_prev <- !is.na(prev_gap) & prev_gap == expected_interval_minutes
+  adjacent_next <- !is.na(next_gap) & next_gap == expected_interval_minutes
+  change <- abs(x - lag(x)); change[!adjacent_prev] <- NA_real_
+  rate_cutoff <- robust_limit(change, rate_mad_multiplier)
+  deviation <- abs(x - (lag(x) + lead(x)) / 2)
+  deviation[!(adjacent_prev & adjacent_next & is.finite(lag(x)) & is.finite(lead(x)))] <- NA_real_
+  neighbor_cutoff <- robust_limit(deviation, neighbor_mad_multiplier)
+  tibble(!!paste0(variable, "_iqr_flag") := replace_na(is.finite(x) & (x < low | x > high), FALSE),
+         !!paste0(variable, "_rate_flag") := replace_na(change > rate_cutoff, FALSE),
+         !!paste0(variable, "_spike_flag") := replace_na(deviation > neighbor_cutoff &
+           abs(x - lag(x)) > rate_cutoff & abs(lead(x) - x) > rate_cutoff, FALSE),
+         !!paste0(variable, "_missing_flag") := !is.finite(x))
+}
+qc <- bind_cols(dat, flag_variable(dat, "Salinity"), flag_variable(dat, "Temperature")) %>%
+  mutate(Salinity_below_5_flag = replace_na(is.finite(Salinity) & Salinity < min_salinity_review, FALSE),
+         any_flag = if_any(ends_with("_flag"), identity),
+         review_decision = if_else(any_flag, "REVIEW", "KEEP"),
+         review_reason = case_when(Salinity_below_5_flag ~ "Check tidal exposure and sensor record",
+                                   any_flag ~ "Inspect surrounding values and sensor record", TRUE ~ ""))
+summary_qc <- qc %>% summarise(total_records = n(), flagged_records = sum(any_flag),
+                               across(ends_with("_flag"), ~ sum(.x, na.rm = TRUE)))
+write_csv(qc, file.path(output_dir, paste0(site_code, "_all_observations_with_QC_flags.csv")))
+write_csv(filter(qc, any_flag), file.path(output_dir, paste0(site_code, "_flagged_observations_for_review.csv")))
+write_csv(summary_qc, file.path(output_dir, paste0(site_code, "_QC_summary.csv")))
+
+# 05. Visual review -------------------------------------------------------
+for (variable in c("Salinity", "Temperature")) {
+  flags <- grep(paste0("^", variable, "_.*_flag$"), names(qc), value = TRUE)
+  selected <- qc %>% filter(if_any(all_of(flags), identity))
+  p <- ggplot(qc, aes(DateTime, .data[[variable]])) +
+    geom_line(color = "grey45", linewidth = .25, na.rm = TRUE) +
+    geom_point(data = selected, color = "#C62828", size = .8, na.rm = TRUE) +
+    labs(title = paste(site_name, variable, "QC"), x = "Date", y = if (variable == "Salinity") "Salinity (PSU)" else "Temperature (°C)") +
+    theme_classic(base_size = 12)
+  ggsave(file.path(output_dir, paste0(site_code, "_", tolower(variable), "_QC.png")), p, width = 12, height = 5, dpi = 300)
+}
+
+# 06. Apply manual review -------------------------------------------------
+if (reviewed_file != "insert csv here") {
+  reviewed <- read_csv(reviewed_file, show_col_types = FALSE)
+  stopifnot(all(c("DateTime", "Salinity", "Temperature", "review_decision") %in% names(reviewed)))
+  reviewed <- reviewed %>% mutate(DateTime = parse_times(DateTime),
+                                   review_decision = toupper(trimws(as.character(review_decision))))
+  if (anyNA(reviewedreviewdecision)||any(!reviewedreview_decision %in% c("KEEP", "REMOVE"))) stop("Resolve every decision to KEEP or REMOVE.")
+  if (nrow(reviewed) != nrow(qc) || anyDuplicated(reviewed$DateTime) ||
+      !setequal(reviewedDateTime,qcDateTime)) stop("Reviewed timestamps do not match original observations.")
+  cleaned <- reviewed %>% filter(review_decision == "KEEP") %>%
+    transmute(DateTime, Salinity = as.numeric(Salinity), Temperature = as.numeric(Temperature)) %>% arrange(DateTime)
+  if (any(!is.finite(cleanedSalinity))||any(!is.finite(cleanedTemperature))) stop("KEEP observations contain missing or nonnumeric values.")
+  write_csv(cleaned, file.path(output_dir, paste0(site_code, "_environmental_cleaned.csv")))
+  write_csv(count(reviewed, review_decision), file.path(output_dir, paste0(site_code, "_QC_decision_summary.csv")))
+}
+print(summary_qc)
+
+# ============================================================================
+# 03. SEASONAL SUMMARY AND THRESHOLD EXPOSURE METRICS
+# ============================================================================
+library(tidyverse)
+library(lubridate)
+
+# 01. Input and site naming -----------------------------------------------
+input_file <- "insert csv here" # Manually cleaned 30-minute logger CSV with DateTime (YYYY-MM-DD HH:MM:SS), Salinity (PSU), Temperature (degrees C); no unreviewed records
+site_code <- "insert name here" # Short site code
+site_name <- "insert name here" # Full site name
+output_dir <- paste0(site_code, "_environmental_summary_outputs")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# 02. Import and validate -------------------------------------------------
+raw <- read_csv(input_file, show_col_types = FALSE)
+stopifnot(all(c("DateTime", "Salinity", "Temperature") %in% names(raw)))
+if ("review_decision" %in% names(raw)) {
+  decision <- toupper(trimws(as.character(raw$review_decision)))
+  if (anyNA(decision) || any(!decision %in% c("KEEP", "REMOVE"))) stop("Resolve all review decisions.")
+  raw <- raw[decision == "KEEP", , drop = FALSE]
+}
+dat <- raw %>% transmute(DateTime = suppressWarnings(ymd_hms(as.character(DateTime), tz = "UTC", quiet = TRUE)),
+                         Salinity = suppressWarnings(as.numeric(Salinity)),
+                         Temperature = suppressWarnings(as.numeric(Temperature))) %>% arrange(DateTime) %>%
+  mutate(Date = as.Date(DateTime, tz = "UTC"), Season = if_else(month(Date) %in% c(11, 12, 1, 2, 3, 4), "W", "S"))
+if (!nrow(dat) || anyNA(datDateTime)||anyDuplicated(datDateTime) ||
+    any(!is.finite(datSalinity))||any(!is.finite(datTemperature))) stop("Invalid, missing or duplicate observations.")
+if (any(minute(datDateTime)%%30!=0|second(datDateTime) != 0)) stop("Timestamps must align to half-hour intervals.")
+gaps <- dat %>% mutate(gap_minutes = as.numeric(difftime(DateTime, lag(DateTime), units = "mins"))) %>%
+  filter(!is.na(gap_minutes), gap_minutes != 30)
+write_csv(gaps, file.path(output_dir, paste0(site_code, "_timestamp_gaps.csv")))
+
+# 03. Daily and seasonal environmental summaries -------------------------
+daily <- dat %>% group_by(Date, Season) %>% summarise(n_observations = n(),
+  mean_salinity = mean(Salinity), min_salinity = min(Salinity), max_salinity = max(Salinity),
+  mean_temperature = mean(Temperature), min_temperature = min(Temperature), max_temperature = max(Temperature), .groups = "drop") %>%
+  mutate(site = site_code, .before = 1)
+write_csv(daily, file.path(output_dir, paste0(site_code, "_daily_summary.csv")))
+summarize_period <- function(period) {
+  d <- if (period == "All") daily else filter(daily, Season == period)
+  if (!nrow(d)) return(tibble())
+  tibble(Site = site_code, Population = site_name, Period = period, Days = nrow(d),
+    Temperature_Mean = mean(dmeantemperature),TemperatureSD=sd(dmean_temperature),
+    Temperature_DailyMean_Min = min(dmeantemperature),TemperatureDailyMeanMax=max(dmean_temperature),
+    Temperature_Observed_Min = min(dmintemperature),TemperatureObservedMax=max(dmax_temperature),
+    Salinity_Mean = mean(dmeansalinity),SalinitySD=sd(dmean_salinity),
+    Salinity_DailyMean_Min = min(dmeansalinity),SalinityDailyMeanMax=max(dmean_salinity),
+    Salinity_Observed_Min = min(dminsalinity),SalinityObservedMax=max(dmax_salinity))
+}
+seasonal_summary <- map_dfr(c("W", "S", "All"), summarize_period)
+write_csv(seasonal_summary, file.path(output_dir, paste0(site_code, "_seasonal_summary.csv")))
+
+# 04. Threshold definitions -----------------------------------------------
+threshold_key <- tibble(Environment = c(rep("Salinity", 5), rep("Temperature", 4)),
+ threshold_id = c("sal_le23", "sal_le27", "sal_ge28", "sal_ge30", "sal_ge32",
+                  "temp_le12", "temp_le13", "temp_14to18", "temp_gt18"),
+ Threshold = c("≤23 PSU", "≤27 PSU", "≥28 PSU", "≥30 PSU", "≥32 PSU",
+               "≤12°C", "≤13°C", "14–18°C", ">18°C"))
+threshold_functions <- list(
+ sal_le23 = function(s,t) s <= 23, sal_le27 = function(s,t) s <= 27,
+ sal_ge28 = function(s,t) s >= 28, sal_ge30 = function(s,t) s >= 30,
+ sal_ge32 = function(s,t) s >= 32, temp_le12 = function(s,t) t <= 12,
+ temp_le13 = function(s,t) t <= 13, temp_14to18 = function(s,t) t >= 14 & t <= 18,
+ temp_gt18 = function(s,t) t > 18)
+
+# 05. Frequency, persistence and cumulative exposure ---------------------
+calendar <- tibble(Date = seq(min(datDate),max(datDate), by = "day"))
+calculate_threshold <- function(id) {
+  exposed <- threshold_functions[[id]](datSalinity,datTemperature)
+  exposure_daily <- tibble(Date = dat$Date, exposed = exposed) %>% group_by(Date) %>%
+    summarise(exposure_day = any(exposed), .groups = "drop") %>%
+    right_join(calendar, by = "Date") %>% arrange(Date) %>%
+    mutate(exposure_day = replace_na(exposure_day, FALSE))
+  runs <- rle(exposure_daily$exposure_day)
+  persistence <- if (any(runsvalues))max(runslengths[runs$values]) else 0L
+  tibble(threshold_id = id, Frequency_days = sum(exposure_daily$exposure_day),
+         Persistence_days = persistence, Cumulative_hours = sum(exposed) * .5)
+}
+threshold_results <- map_dfr(threshold_key$threshold_id, calculate_threshold) %>%
+  left_join(threshold_key, by = "threshold_id") %>%
+  mutate(Site = site_code, Population = site_name, Monitoring_hours = nrow(dat) * .5,
+         Monitoring_days = n_distinct(dat$Date), Calendar_days = nrow(calendar)) %>%
+  select(Site, Population, Monitoring_hours, Monitoring_days, Calendar_days,
+         Environment, Threshold, threshold_id, Frequency_days, Persistence_days, Cumulative_hours)
+write_csv(threshold_results, file.path(output_dir, paste0(site_code, "_threshold_results.csv")))
+print(seasonal_summary, width = Inf)
+print(threshold_results, n = Inf, width = Inf)
+
+# ============================================================================
+# 04. DAILY ENVIRONMENTAL, PRECIPITATION AND IVT FIGURES
+# ============================================================================
+library(tidyverse)
+library(lubridate)
+
+# 01. Input files ---------------------------------------------------------
+daily_file <- "insert csv here" # Combined daily environmental CSV with site, Date (or date), mean_salinity, min_salinity, max_salinity, mean_temperature, min_temperature, max_temperature
+precipitation_file <- "insert csv here" # NOAA daily precipitation CSV with DATE, PRCP, optional NAME; one record per station and date
+ar_file <- "insert csv here" # Hourly IVT CSV with datetime and IVT (kg m^-1 s^-1); first two columns may be timestamp and IVT without headers
+station_name <- "insert name here" # NOAA NAME field exactly, or set to "" for single-station CSV
+precip_unit <- "mm" # "mm" or "tenths_mm"; check source metadata
+ar_has_header <- TRUE # Set FALSE for headerless hourly IVT CSV
+output_dir <- "environmental_figure_outputs"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+site_labels <- c(DE = "Drakes Estero", FB = "Fort Baker", HMB = "Half Moon Bay", SFYC = "St. Francis Yacht Club", PB = "Point Bonita")
+site_colors <- c(DE = "#A64CE6", FB = "#C8B900", HMB = "#1565D8", SFYC = "#14B83A", PB = "#D95F02")
+normalize_site <- function(x) dplyr::recode(trimws(as.character(x)),
+  "Drakes Estero" = "DE", "Fort Baker" = "FB", "Half Moon Bay" = "HMB",
+  "St. Francis Yacht Club" = "SFYC", "Point Bonita" = "PB", .default = as.character(x))
+save_plot <- function(p, file, w = 12, h = 7) ggsave(file.path(output_dir, file), p, width = w, height = h, dpi = 300)
+
+# 02. Environmental time series ------------------------------------------
+env <- read_csv(daily_file, show_col_types = FALSE) %>% rename_with(tolower)
+if ("date" %in% names(env)) env <- env %>% mutate(date = as.Date(date))
+stopifnot(all(c("site", "date", "mean_salinity", "min_salinity", "max_salinity",
+                "mean_temperature", "min_temperature", "max_temperature") %in% names(env)))
+env <- env %>% mutate(site = normalize_site(site), across(matches("^(min|mean|max)_(temperature|salinity)$"), as.numeric))
+if (anyNA(env$date) || anyDuplicated(env[c("site", "date")])) stop("Invalid or duplicate site dates.")
+env_long <- env %>% pivot_longer(matches("^(min|mean|max)_(temperature|salinity)$"),
+ names_to = c("statistic", "variable"), names_pattern = "^(min|mean|max)_(temperature|salinity)$", values_to = "value")
+for (v in c("temperature", "salinity")) {
+  p <- env_long %>% filter(variable == v) %>% ggplot(aes(date, value, color = statistic)) +
+    geom_line(linewidth = .5, na.rm = TRUE) + facet_wrap(~ site, ncol = 2, scales = "free_x") +
+    scale_color_manual(values = c(min = "#9ecae1", mean = "#2171b5", max = "#08306b")) +
+    labs(x = "Date", y = if (v == "salinity") "Salinity (PSU)" else "Temperature (°C)", color = NULL) + theme_classic(base_size = 12)
+  save_plot(p, paste0(v, "_daily_min_mean_max.png"), 13, 8)
+}
+
+# 03. Precipitation -------------------------------------------------------
+prcp_raw <- read_csv(precipitation_file, show_col_types = FALSE)
+stopifnot(all(c("DATE", "PRCP") %in% names(prcp_raw)))
+if ("NAME" %in% names(prcp_raw) && nzchar(station_name) && station_name != "insert name here") {
+  prcp_raw <- filter(prcp_raw, NAME == station_name)
+}
+if (!precip_unit %in% c("mm", "tenths_mm")) stop("Set precip_unit to mm or tenths_mm.")
+precip <- prcp_raw %>% transmute(date = as.Date(DATE),
+ precipitation_mm = as.numeric(PRCP) / if_else(precip_unit == "tenths_mm", 10, 1)) %>%
+ filter(!is.na(date), !is.na(precipitation_mm)) %>% arrange(date)
+if (!nrow(precip) || anyDuplicated(precip$date) || any(precip$precipitation_mm < 0)) stop("Invalid precipitation records.")
+
+# 04. IVT event indicator -------------------------------------------------
+ar_raw <- read_csv(ar_file, col_names = ar_has_header, show_col_types = FALSE)
+if (!ar_has_header) names(ar_raw)[1:2] <- c("datetime", "IVT")
+stopifnot(all(c("datetime", "IVT") %in% names(ar_raw)))
+ar_hourly <- ar_raw %>% transmute(datetime = parse_date_time(as.character(datetime),
+ orders = c("ymd HMS", "ymd HM", "ymd H"), tz = "UTC"), IVT = as.numeric(IVT)) %>%
+ filter(!is.na(datetime), is.finite(IVT)) %>% mutate(date = as.Date(datetime, tz = "UTC"))
+if (anyDuplicated(ar_hourly$datetime)) stop("Duplicate hourly IVT timestamps.")
+ar_daily <- ar_hourly %>% group_by(date) %>% summarise(max_IVT = max(IVT),
+ hours_IVT_250 = sum(IVT >= 250), observed_hours = n(), .groups = "drop") %>%
+ mutate(AR_day = observed_hours >= 12 & hours_IVT_250 >= 12,
+        AR_strength = case_when(!AR_day ~ "No AR", max_IVT >= 1000 ~ "Extreme AR",
+                                max_IVT >= 750 ~ "Strong AR", max_IVT >= 500 ~ "Moderate AR", TRUE ~ "Weak AR"))
+precip_ar <- left_join(precip, ar_daily, by = "date")
+p95 <- unname(quantile(precip_ar$precipitation_mm, .95, na.rm = TRUE))
+p98 <- unname(quantile(precip_ar$precipitation_mm, .98, na.rm = TRUE))
+precip_ar <- precip_ar %>% mutate(percentile_class = case_when(
+ precipitation_mm > p98 ~ "98th percentile", precipitation_mm > p95 ~ "95th percentile", TRUE ~ NA_character_))
+write_csv(precip_ar, file.path(output_dir, "precipitation_IVT_daily.csv"))
+p <- ggplot(precip_ar, aes(date, precipitation_mm)) + geom_col(fill = "#9ecae1", width = 1) +
+ geom_hline(yintercept = p95, linetype = "dashed") + geom_hline(yintercept = p98) +
+ geom_point(data = filter(precip_ar, !is.na(percentile_class)),
+ aes(shape = percentile_class, fill = AR_strength), size = 3, color = "black") +
+ scale_shape_manual(values = c("95th percentile" = 21, "98th percentile" = 24)) +
+ scale_fill_manual(values = c("Weak AR" = "#F3C79E", "Moderate AR" = "#D9791F",
+                              "Strong AR" = "#6B3A0A", "Extreme AR" = "#7F0000", "No AR" = "white")) +
+ labs(x = "Date", y = "Daily precipitation (mm)", shape = "Precipitation threshold", fill = "IVT event class") + theme_classic(base_size = 12)
+save_plot(p, "precipitation_IVT_events.png", 14, 6)
+
+# 05. Environmental response and precipitation ---------------------------
+for (s in intersect(names(site_labels), unique(env$site))) {
+ for (v in c("mean_temperature", "mean_salinity")) {
+  d <- env %>% filter(site == s) %>% left_join(precip, by = "date")
+  factor_scale <- max(d[[v]], na.rm = TRUE) / max(d$precipitation_mm, na.rm = TRUE) * .35
+  if (!is.finite(factor_scale) || factor_scale <= 0) factor_scale <- 1
+  p <- ggplot(d, aes(date)) + geom_col(aes(y = precipitation_mm * factor_scale),
+      fill = "#9ecae1", alpha = .5, width = 1, na.rm = TRUE) +
+    geom_line(aes(y = .data[[v]]), color = site_colors[[s]], linewidth = .65, na.rm = TRUE) +
+    scale_y_continuous(name = if (v == "mean_salinity") "Salinity (PSU)" else "Temperature (°C)",
+                       sec.axis = sec_axis(~ . / factor_scale, name = "Precipitation (mm)")) +
+    labs(title = site_labels[[s]], x = "Date") + theme_classic(base_size = 12)
+  save_plot(p, paste0(s, "_", v, "_precipitation.png"))
+ }
+}
+
+# ============================================================================
+# 05. HETEROZYGOSITY GLMMS: NINE THRESHOLDS x THREE EXPOSURE METRICS
+# ============================================================================
+library(tidyverse)
+library(lme4)
+
+# 01. Input files ---------------------------------------------------------
+heterozygosity_file <- "insert csv here" # Output genotype_locus_heterozygosity.csv from 01_genetics.R; columns site, individual, locus, heterozygosity (0/1/NA)
+threshold_file <- "insert csv here" # Combined site threshold CSV: Site, Environment, Threshold, threshold_id, Frequency_days, Persistence_days, Cumulative_hours; one row per site and threshold
+output_dir <- "GLMM_threshold_outputs"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+site_codes <- c("DE", "FB", "HMB", "SFYC") # Sites with environmental logger data; edit to match available data
+
+# 02. Import and validate -------------------------------------------------
+response <- read_csv(heterozygosity_file, show_col_types = FALSE) %>%
+  filter(site %in% site_codes, !is.na(heterozygosity)) %>%
+  mutate(locus = factor(locus), heterozygosity = as.integer(heterozygosity))
+stopifnot(all(c("site", "individual", "locus", "heterozygosity") %in% names(response)),
+          all(response$heterozygosity %in% c(0L, 1L)))
+stress <- read_csv(threshold_file, show_col_types = FALSE) %>%
+  rename(site = Site, environment = Environment, threshold = Threshold,
+         frequency_days = Frequency_days, persistence_days = Persistence_days,
+         cumulative_hours = Cumulative_hours) %>%
+  filter(site %in% site_codes)
+stopifnot(all(c("site", "environment", "threshold", "threshold_id", "frequency_days",
+                "persistence_days", "cumulative_hours") %in% names(stress)))
+if (anyDuplicated(stress[c("site", "threshold_id")])) stop("Duplicate site-threshold combinations.")
+if (n_distinct(response$site) < 3) stop("At least three sites are needed for this exploratory model.")
+if (!setequal(unique(responsesite),unique(stresssite))) stop("Response and exposure site sets differ.")
+
+# 03. Prepare predictors --------------------------------------------------
+model_key <- stress %>% pivot_longer(c(frequency_days, persistence_days, cumulative_hours),
+  names_to = "metric_column", values_to = "exposure_value") %>%
+  mutate(Metric = recode(metric_column, frequency_days = "Frequency",
+                         persistence_days = "Persistence", cumulative_hours = "Cumulative"),
+         Environment = str_to_title(environment), Threshold = threshold,
+         variable = paste(threshold_id, metric_column, sep = "_"))
+if (n_distinct(model_key$variable) != 27) stop("Expected 27 threshold-metric predictors.")
+site_scaling <- model_key %>% group_by(variable) %>% summarise(
+  predictor_mean = mean(exposure_value), predictor_sd = sd(exposure_value),
+  n_unique = n_distinct(exposure_value), .groups = "drop")
+write_csv(site_scaling, file.path(output_dir, "GLMM_predictor_scaling.csv"))
+model_key <- model_key %>% left_join(site_scaling, by = "variable") %>%
+  mutate(z = if_else(is.finite(predictor_sd) & predictor_sd > 0,
+                     (exposure_value - predictor_mean) / predictor_sd, NA_real_))
+
+# 04. Fit models ----------------------------------------------------------
+control <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 200000))
+null_model <- glmer(heterozygosity ~ 1 + (1 | locus), data = response,
+                   family = binomial(link = "logit"), control = control)
+fit_one <- function(key) {
+  predictor <- model_key %>% filter(variable == key) %>% select(site, z)
+  d <- response %>% left_join(predictor, by = "site")
+  if (anyNA(dz)||ndistinct(dz) < 2) return(tibble(variable = key,
+    Beta = NA_real_, SE = NA_real_, z_stat = NA_real_, p = NA_real_,
+    CI_lower = NA_real_, CI_upper = NA_real_, Odds_ratio = NA_real_, AIC = NA_real_,
+    singular = NA, convergence = "Insufficient site variation"))
+  tryCatch({
+    fit <- glmer(heterozygosity ~ z + (1 | locus), data = d,
+                 family = binomial(link = "logit"), control = control)
+    co <- summary(fit)$coefficients["z", ]
+    beta <- unname(co["Estimate"]); se <- unname(co["Std. Error"])
+    tibble(variable = key, Beta = beta, SE = se, z_stat = unname(co["z value"]),
+           p = unname(co["Pr(>|z|)"]), CI_lower = beta - 1.96 * se,
+           CI_upper = beta + 1.96 * se, Odds_ratio = exp(beta), AIC = AIC(fit),
+           singular = isSingular(fit), convergence = if (is.null(fit@optinfoconvlme4$messages))
+             "OK" else paste(fit@optinfoconvlme4$messages, collapse = "; "))
+  }, error = function(e) tibble(variable = key, Beta = NA_real_, SE = NA_real_,
+    z_stat = NA_real_, p = NA_real_, CI_lower = NA_real_, CI_upper = NA_real_,
+    Odds_ratio = NA_real_, AIC = NA_real_, singular = NA,
+    convergence = conditionMessage(e)))
+}
+fits <- map_dfr(unique(model_key$variable), fit_one)
+if (!any(is.finite(fits$AIC))) stop("No GLMMs could be fitted.")
+glmm_results <- model_key %>% distinct(variable, Environment, Metric, Threshold, threshold_id) %>%
+  left_join(fits, by = "variable") %>% mutate(Null_AIC = AIC(null_model),
+    Delta_AIC = AIC - min(AIC, na.rm = TRUE), AIC_improvement_over_null = Null_AIC - AIC,
+    AIC_support = case_when(is.na(Delta_AIC) ~ "Not fitted", Delta_AIC <= 2 ~ "0–2",
+      Delta_AIC <= 7 ~ "2–7", Delta_AIC <= 10 ~ "7–10", Delta_AIC <= 20 ~ "10–20",
+      Delta_AIC <= 30 ~ "20–30", TRUE ~ ">30")) %>% arrange(AIC)
+write_csv(glmm_results, file.path(output_dir, "GLMM_27_model_results.csv"))
+
+# 05. Forest plots --------------------------------------------------------
+plot_data <- glmm_results %>% filter(is.finite(Beta)) %>%
+  mutate(AIC_support = factor(AIC_support, levels = c("0–2", "2–7", "7–10", "10–20", "20–30", ">30")))
+for (metric_name in c("Frequency", "Persistence", "Cumulative")) {
+  p <- plot_data %>% filter(Metric == metric_name) %>%
+    ggplot(aes(Beta, reorder(paste(Environment, Threshold), Beta),
+               color = Environment, shape = AIC_support)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey60") +
+    geom_segment(aes(x = CI_lower, xend = CI_upper, yend = reorder(paste(Environment, Threshold), Beta))) +
+    geom_point(size = 3) + labs(x = "Standardized log-odds coefficient (95% Wald CI)",
+                               y = NULL, shape = "ΔAIC") + theme_classic(base_size = 12)
+  ggsave(file.path(output_dir, paste0("GLMM_forest_", tolower(metric_name), ".png")),
+         p, width = 11, height = 7, dpi = 300)
+}
+print(glmm_results, n = Inf, width = Inf)
+
